@@ -1,0 +1,54 @@
+name: leetcode-nag
+
+on:
+  schedule:
+    - cron: "0 0 * * *"   # 7pm EST -> 00:00 UTC next day
+    - cron: "0 23 * * *"  # 7pm EDT -> 23:00 UTC same day
+  workflow_dispatch: {}    # the 7pm gate below is skipped on manual runs
+
+jobs:
+  nag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to commit state.json back
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip unless it's actually 7pm Eastern right now
+        if: github.event_name == 'schedule'
+        run: |
+          hour=$(TZ=America/New_York date +%H)
+          if [ "$hour" != "19" ]; then
+            echo "Not 7pm Eastern right now ($hour:00) — the other cron line handles this season."
+            echo "SKIP=true" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: env.SKIP != 'true'
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        if: env.SKIP != 'true'
+        run: pip install -r requirements.txt
+
+      - name: Run nag script
+        if: env.SKIP != 'true'
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          BLIND75_DATABASE_ID: ${{ secrets.BLIND75_DATABASE_ID }}
+          SCHEDULE_DATABASE_ID: ${{ secrets.SCHEDULE_DATABASE_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
+        run: python nag.py
+
+      - name: Commit state.json if it changed
+        if: env.SKIP != 'true'
+        run: |
+          if ! git diff --quiet -- state.json; then
+            git config user.name "leetcode-nagger"
+            git config user.email "actions@users.noreply.github.com"
+            git add state.json
+            git commit -m "chore: update nag state"
+            git push
+          fi

@@ -152,6 +152,7 @@ activemq-data/
 .envrc
 .venv
 env/
+venv-leetcode-nagger/
 venv/
 ENV/
 env.bak/
