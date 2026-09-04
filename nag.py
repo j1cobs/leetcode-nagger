@@ -320,6 +320,7 @@ def main() -> None:
         state["last_congratulated_week_start"] = week_key
         post_discord(build_congrats_embed(state["streak"], cold_done, cold_target))
 
+    state["last_run_date"] = datetime.now(TZ).date().isoformat()
     save_state(state)
 
     all_problems = all_cold_attempted(blind75_ds_id) if is_sunday else []
