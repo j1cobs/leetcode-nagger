@@ -108,15 +108,31 @@ def prop_select(page: dict, name: str) -> str | None:
     return sel["name"] if sel else None
 
 
+def prop_relation_ids(page: dict, name: str) -> list[str]:
+    return [r["id"] for r in page["properties"].get(name, {}).get("relation", [])]
+
+
+def prop_rollup_number(page: dict, name: str) -> float | None:
+    return page["properties"].get(name, {}).get("rollup", {}).get("number")
+
+
+def fetch_page_title_map(ds_id: str) -> dict[str, str]:
+    """Maps Tracker page id -> Problem title, so a Master Schedule week's
+    New Problems / Come Back To relations can be resolved to names."""
+    return {p["id"]: prop_title(p, "Problem") for p in query_data_source(ds_id)}
+
+
 # ---------------------------------------------------------------------------
 # Schedule
 # ---------------------------------------------------------------------------
 
 def current_week(schedule_ds_id: str | None, today: date):
-    """Returns (week_start, week_end, target) for the week containing `today`,
-    or (None, None, None) if there's no Master Schedule / no matching week."""
+    """Returns (week_start, week_end, target, new_problem_ids, come_back_ids)
+    for the week containing `today`, or (None, None, None, [], []) if there's
+    no Master Schedule / no matching week. `target` reads the "# New" rollup
+    if present, falling back to a plain number for older schema versions."""
     if not schedule_ds_id:
-        return None, None, None
+        return None, None, None, [], []
     for page in query_data_source(schedule_ds_id):
         d = page["properties"].get("Dates", {}).get("date")
         if not d or not d.get("start") or not d.get("end"):
@@ -124,9 +140,13 @@ def current_week(schedule_ds_id: str | None, today: date):
         start = date.fromisoformat(d["start"][:10])
         end = date.fromisoformat(d["end"][:10])
         if start <= today <= end:
-            target = prop_number(page, "# New")
-            return start, end, int(target) if target is not None else None
-    return None, None, None
+            target = prop_rollup_number(page, "# New")
+            if target is None:
+                target = prop_number(page, "# New")
+            new_ids = prop_relation_ids(page, "New Problems")
+            come_back_ids = prop_relation_ids(page, "Come Back To")
+            return start, end, int(target) if target is not None else None, new_ids, come_back_ids
+    return None, None, None, [], []
 
 
 # ---------------------------------------------------------------------------
@@ -143,40 +163,57 @@ def cold_attempts_in_range(blind75_ds_id: str, start: date, end: date) -> int:
     return len(query_data_source(blind75_ds_id, filter_obj))
 
 
+# Spaced-repetition ladder: each stage's Notion property, and its offset in
+# days from the original Cold ✓ attempt (not from the previous stage).
+REVIEW_STAGES = [
+    ("Review D+2 ✓", 2),
+    ("Review D+9 ✓", 9),
+    ("Review D+30 ✓", 30),
+    ("Review D+90 ✓", 90),
+]
+
+
 def overdue_reviews(blind75_ds_id: str, today: date) -> list[dict]:
-    """Problems with Cold✓ set but 1wk Review blank and >7d old, or 1wk Review
-    set but 3wk Review blank and >14d past the 1wk date."""
-    one_week_ago = (today - timedelta(days=7)).isoformat()
-    two_weeks_ago = (today - timedelta(days=14)).isoformat()
+    """Walks each attempted problem's ladder (Cold ✓ -> D+2 -> D+9 -> D+30 ->
+    D+90) to find whether its next review stage is due.
 
-    overdue_1wk_filter = {
-        "and": [
-            {"property": "Cold ✓", "date": {"is_not_empty": True}},
-            {"property": "1wk Review", "date": {"is_empty": True}},
-            {"property": "Cold ✓", "date": {"on_or_before": one_week_ago}},
-        ]
-    }
-    overdue_3wk_filter = {
-        "and": [
-            {"property": "1wk Review", "date": {"is_not_empty": True}},
-            {"property": "3wk Review", "date": {"is_empty": True}},
-            {"property": "1wk Review", "date": {"on_or_before": two_weeks_ago}},
-        ]
-    }
-
+    A stage's due date is normally Cold ✓ + that stage's fixed offset. But if
+    Result on the most recently completed stage was "Partial" or "No" (a hint
+    was needed, or it wasn't solved), the ladder doesn't advance to the next
+    fixed offset — it resets to a short 2-day retry from that stage's
+    completion date instead. A problem retires (stops being nagged) once
+    Review D+90 is completed with Result "Yes".
+    """
     overdue = []
-    for page in query_data_source(blind75_ds_id, overdue_1wk_filter):
-        overdue.append({
-            "name": prop_title(page, "Problem"),
-            "difficulty": prop_select(page, "Difficulty"),
-            "since": prop_date(page, "Cold ✓") + timedelta(days=7),
-        })
-    for page in query_data_source(blind75_ds_id, overdue_3wk_filter):
-        overdue.append({
-            "name": prop_title(page, "Problem"),
-            "difficulty": prop_select(page, "Difficulty"),
-            "since": prop_date(page, "1wk Review") + timedelta(days=14),
-        })
+    filter_obj = {"property": "Cold ✓", "date": {"is_not_empty": True}}
+    for page in query_data_source(blind75_ds_id, filter_obj):
+        cold = prop_date(page, "Cold ✓")
+        result = prop_select(page, "Result")
+
+        last_stage_date = cold
+        last_stage_index = -1  # -1 == only Cold ✓ done so far
+        for i, (prop_name, _offset) in enumerate(REVIEW_STAGES):
+            d = prop_date(page, prop_name)
+            if d is None:
+                break
+            last_stage_date = d
+            last_stage_index = i
+
+        if last_stage_index == len(REVIEW_STAGES) - 1 and result == "Yes":
+            continue  # retired: D+90 passed cleanly
+
+        if result in ("Partial", "No"):
+            due = last_stage_date + timedelta(days=2)
+        else:
+            next_index = min(last_stage_index + 1, len(REVIEW_STAGES) - 1)
+            due = cold + timedelta(days=REVIEW_STAGES[next_index][1])
+
+        if due <= today:
+            overdue.append({
+                "name": prop_title(page, "Problem"),
+                "difficulty": prop_select(page, "Difficulty"),
+                "since": due,
+            })
     return overdue
 
 
@@ -227,7 +264,9 @@ def post_discord(payload: dict) -> None:
 
 
 def build_nag_embed(today: date, did_cold_today: bool, cold_done: int, cold_target: int | None,
-                     overdue: list[dict], is_sunday: bool, all_problems: list[str]) -> dict:
+                     overdue: list[dict], is_sunday: bool, all_problems: list[str],
+                     new_problem_names: list[str] | None = None,
+                     come_back_names: list[str] | None = None) -> dict:
     fields = []
     color = 0xF1C40F  # amber default: "you didn't do a problem today"
 
@@ -247,9 +286,17 @@ def build_nag_embed(today: date, did_cold_today: bool, cold_done: int, cold_targ
     elif not did_cold_today and (cold_target is None or cold_done < cold_target):
         target_str = (f"{cold_done}/{cold_target} done this week."
                       if cold_target is not None else f"{cold_done} done this week.")
+        if new_problem_names:
+            problems_str = "\n".join(f"• {n}" for n in new_problem_names)
+            value = f"{target_str}\n{problems_str}"
+        else:
+            value = f"Do a new cold attempt today.\n{target_str}"
+        fields.append({"name": "New cold attempt pending", "value": value[:1000], "inline": False})
+
+    if not is_sunday and come_back_names:
         fields.append({
-            "name": "New cold attempt pending",
-            "value": f"Do a new cold attempt today.\n{target_str}",
+            "name": "This week's reviews",
+            "value": "\n".join(f"• {n}" for n in come_back_names)[:1000],
             "inline": False,
         })
 
@@ -293,7 +340,7 @@ def main() -> None:
     blind75_ds_id = get_data_source_id(BLIND75_DATABASE_ID)
     schedule_ds_id = get_data_source_id(SCHEDULE_DATABASE_ID) if SCHEDULE_DATABASE_ID else None
 
-    week_start, week_end, cold_target = current_week(schedule_ds_id, today)
+    week_start, week_end, cold_target, new_ids, come_back_ids = current_week(schedule_ds_id, today)
     if week_start is None:
         # No Master Schedule / no matching week row: fall back to "nag once a
         # day, no weekly cap" mode, same as leaving SCHEDULE_TAB blank in the
@@ -301,6 +348,12 @@ def main() -> None:
         week_start = today - timedelta(days=today.weekday())
         week_end = week_start + timedelta(days=6)
     week_key = week_start.isoformat()
+
+    new_problem_names = come_back_names = []
+    if new_ids or come_back_ids:
+        title_map = fetch_page_title_map(blind75_ds_id)
+        new_problem_names = [title_map[i] for i in new_ids if i in title_map]
+        come_back_names = [title_map[i] for i in come_back_ids if i in title_map]
 
     state = load_state()
 
@@ -324,7 +377,8 @@ def main() -> None:
     save_state(state)
 
     all_problems = all_cold_attempted(blind75_ds_id) if is_sunday else []
-    embed = build_nag_embed(today, did_cold_today, cold_done, cold_target, overdue, is_sunday, all_problems)
+    embed = build_nag_embed(today, did_cold_today, cold_done, cold_target, overdue, is_sunday,
+                             all_problems, new_problem_names, come_back_names)
     if embed:
         post_discord(embed)
     # else: quiet day, no Discord ping.
