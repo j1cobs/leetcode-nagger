@@ -33,6 +33,7 @@ except ImportError:
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 BLIND75_DATABASE_ID = os.environ["BLIND75_DATABASE_ID"]
 SCHEDULE_DATABASE_ID = os.environ.get("SCHEDULE_DATABASE_ID")  # optional, like original SCHEDULE_TAB
+WEAK_PATTERNS_DATABASE_ID = os.environ.get("WEAK_PATTERNS_DATABASE_ID")  # optional
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 DISCORD_USER_ID = os.environ.get("DISCORD_USER_ID")
 
@@ -116,10 +117,41 @@ def prop_rollup_number(page: dict, name: str) -> float | None:
     return page["properties"].get(name, {}).get("rollup", {}).get("number")
 
 
-def fetch_page_title_map(ds_id: str) -> dict[str, str]:
-    """Maps Tracker page id -> Problem title, so a Master Schedule week's
-    New Problems / Come Back To relations can be resolved to names."""
-    return {p["id"]: prop_title(p, "Problem") for p in query_data_source(ds_id)}
+def prop_rich_text(page: dict, name: str) -> str:
+    parts = page["properties"].get(name, {}).get("rich_text", [])
+    return "".join(p.get("plain_text", "") for p in parts)
+
+
+def prop_multi_select(page: dict, name: str) -> list[str]:
+    return [o["name"] for o in page["properties"].get(name, {}).get("multi_select", [])]
+
+
+def fetch_problem_info(ds_id: str) -> dict[str, dict]:
+    """Maps Tracker page id -> {title, pattern, attempted}, so a Master
+    Schedule week's New Problems / Come Back To relations can be resolved
+    to names, filtered by whether they've actually been attempted, and
+    checked against the Weak Patterns database."""
+    info = {}
+    for p in query_data_source(ds_id):
+        info[p["id"]] = {
+            "title": prop_title(p, "Problem"),
+            "pattern": prop_select(p, "Pattern"),
+            "attempted": prop_date(p, "Cold ✓") is not None,
+        }
+    return info
+
+
+def fetch_weak_patterns(ds_id: str) -> dict[str, list[str]]:
+    """Maps Pattern name -> list of Weak Patterns Descriptions that apply
+    to it, from the "Applies To" multi-select property."""
+    patterns: dict[str, list[str]] = {}
+    for p in query_data_source(ds_id):
+        desc = prop_rich_text(p, "Description")
+        if not desc:
+            continue
+        for pattern in prop_multi_select(p, "Applies To"):
+            patterns.setdefault(pattern, []).append(desc)
+    return patterns
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +204,15 @@ REVIEW_STAGES = [
     ("Review D+90 ✓", 90),
 ]
 
+# How soon to retry after a struggled (Partial/No) attempt. Kept short to
+# reinforce the fix while it's fresh, but long enough to not require
+# back-to-back-day availability for someone working full-time.
+RETRY_INTERVAL_DAYS = 4
+
+# Overdue-review count at which the nag stops pushing new problems and
+# focuses on clearing the backlog instead ("catch-up mode").
+CATCHUP_THRESHOLD = 5
+
 
 def overdue_reviews(blind75_ds_id: str, today: date) -> list[dict]:
     """Walks each attempted problem's ladder (Cold ✓ -> D+2 -> D+9 -> D+30 ->
@@ -180,7 +221,7 @@ def overdue_reviews(blind75_ds_id: str, today: date) -> list[dict]:
     A stage's due date is normally Cold ✓ + that stage's fixed offset. But if
     Result on the most recently completed stage was "Partial" or "No" (a hint
     was needed, or it wasn't solved), the ladder doesn't advance to the next
-    fixed offset — it resets to a short 2-day retry from that stage's
+    fixed offset — it resets to a RETRY_INTERVAL_DAYS retry from that stage's
     completion date instead. A problem retires (stops being nagged) once
     Review D+90 is completed with Result "Yes".
     """
@@ -203,7 +244,7 @@ def overdue_reviews(blind75_ds_id: str, today: date) -> list[dict]:
             continue  # retired: D+90 passed cleanly
 
         if result in ("Partial", "No"):
-            due = last_stage_date + timedelta(days=2)
+            due = last_stage_date + timedelta(days=RETRY_INTERVAL_DAYS)
         else:
             next_index = min(last_stage_index + 1, len(REVIEW_STAGES) - 1)
             due = cold + timedelta(days=REVIEW_STAGES[next_index][1])
@@ -213,6 +254,7 @@ def overdue_reviews(blind75_ds_id: str, today: date) -> list[dict]:
                 "name": prop_title(page, "Problem"),
                 "difficulty": prop_select(page, "Difficulty"),
                 "since": due,
+                "last_snag": prop_rich_text(page, "Last Snag") or None,
             })
     return overdue
 
@@ -266,29 +308,43 @@ def post_discord(payload: dict) -> None:
 def build_nag_embed(today: date, did_cold_today: bool, cold_done: int, cold_target: int | None,
                      overdue: list[dict], is_sunday: bool, all_problems: list[str],
                      new_problem_names: list[str] | None = None,
-                     come_back_names: list[str] | None = None) -> dict:
+                     come_back_names: list[str] | None = None,
+                     new_problem_warnings: dict[str, list[str]] | None = None,
+                     catchup_mode: bool = False) -> dict:
     fields = []
     color = 0xF1C40F  # amber default: "you didn't do a problem today"
 
     if overdue:
         color = 0xE74C3C  # red wins over everything else
-        lines = "\n".join(
-            f"• {o['name']} ({o['difficulty']}) — {(today - o['since']).days}d overdue"
-            for o in overdue[:10]
-        )
-        fields.append({"name": f"{len(overdue)} review(s) overdue", "value": lines, "inline": False})
+        lines = []
+        for o in overdue[:10]:
+            line = f"• {o['name']} ({o['difficulty']}) — {(today - o['since']).days}d overdue"
+            if o.get("last_snag"):
+                line += f' — last snag: "{o["last_snag"][:100]}"'
+            lines.append(line)
+        fields.append({"name": f"{len(overdue)} review(s) overdue", "value": "\n".join(lines), "inline": False})
 
     if is_sunday:
         if not overdue:
             color = 0x3498DB  # blue, but only if nothing worse is going on
         listed = ", ".join(all_problems) if all_problems else "nothing logged yet"
         fields.append({"name": "Sunday: go re-read your notes", "value": listed[:1000], "inline": False})
+    elif catchup_mode:
+        fields.append({
+            "name": "🐢 Catch-up mode",
+            "value": f"{len(overdue)} reviews overdue — clear these before starting new problems.",
+            "inline": False,
+        })
     elif not did_cold_today and (cold_target is None or cold_done < cold_target):
         target_str = (f"{cold_done}/{cold_target} done this week."
                       if cold_target is not None else f"{cold_done} done this week.")
         if new_problem_names:
-            problems_str = "\n".join(f"• {n}" for n in new_problem_names)
-            value = f"{target_str}\n{problems_str}"
+            lines = [f"{target_str}"]
+            for n in new_problem_names:
+                lines.append(f"• {n}")
+                for warning in (new_problem_warnings or {}).get(n, []):
+                    lines.append(f"  ⚠ {warning}")
+            value = "\n".join(lines)
         else:
             value = f"Do a new cold attempt today.\n{target_str}"
         fields.append({"name": "New cold attempt pending", "value": value[:1000], "inline": False})
@@ -339,6 +395,7 @@ def main() -> None:
 
     blind75_ds_id = get_data_source_id(BLIND75_DATABASE_ID)
     schedule_ds_id = get_data_source_id(SCHEDULE_DATABASE_ID) if SCHEDULE_DATABASE_ID else None
+    weak_patterns_ds_id = get_data_source_id(WEAK_PATTERNS_DATABASE_ID) if WEAK_PATTERNS_DATABASE_ID else None
 
     week_start, week_end, cold_target, new_ids, come_back_ids = current_week(schedule_ds_id, today)
     if week_start is None:
@@ -350,10 +407,23 @@ def main() -> None:
     week_key = week_start.isoformat()
 
     new_problem_names = come_back_names = []
+    new_problem_warnings: dict[str, list[str]] = {}
     if new_ids or come_back_ids:
-        title_map = fetch_page_title_map(blind75_ds_id)
-        new_problem_names = [title_map[i] for i in new_ids if i in title_map]
-        come_back_names = [title_map[i] for i in come_back_ids if i in title_map]
+        problem_info = fetch_problem_info(blind75_ds_id)
+        new_problem_names = [problem_info[i]["title"] for i in new_ids if i in problem_info]
+        # Only nag to review a problem that's actually been attempted -
+        # Come Back To can reference problems from the study plan's assumed
+        # history that were never really solved (e.g. a skipped phase).
+        come_back_names = [
+            problem_info[i]["title"] for i in come_back_ids
+            if i in problem_info and problem_info[i]["attempted"]
+        ]
+        if weak_patterns_ds_id and new_ids:
+            weak_map = fetch_weak_patterns(weak_patterns_ds_id)
+            for i in new_ids:
+                info = problem_info.get(i)
+                if info and info["pattern"] in weak_map:
+                    new_problem_warnings[info["title"]] = weak_map[info["pattern"]]
 
     state = load_state()
 
@@ -366,6 +436,7 @@ def main() -> None:
     cold_done = cold_attempts_in_range(blind75_ds_id, week_start, week_end)
     did_cold_today = cold_attempts_in_range(blind75_ds_id, today, today) > 0
     overdue = overdue_reviews(blind75_ds_id, today)
+    catchup_mode = len(overdue) >= CATCHUP_THRESHOLD
     hit_quota = cold_target is not None and cold_done >= cold_target
 
     if hit_quota and state.get("last_congratulated_week_start") != week_key:
@@ -378,7 +449,8 @@ def main() -> None:
 
     all_problems = all_cold_attempted(blind75_ds_id) if is_sunday else []
     embed = build_nag_embed(today, did_cold_today, cold_done, cold_target, overdue, is_sunday,
-                             all_problems, new_problem_names, come_back_names)
+                             all_problems, new_problem_names, come_back_names, new_problem_warnings,
+                             catchup_mode)
     if embed:
         post_discord(embed)
     # else: quiet day, no Discord ping.
