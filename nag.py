@@ -198,7 +198,6 @@ def cold_attempts_in_range(blind75_ds_id: str, start: date, end: date) -> int:
 # Spaced-repetition ladder: each stage's Notion property, and its offset in
 # days from the original Cold ✓ attempt (not from the previous stage).
 REVIEW_STAGES = [
-    ("Review D+2 ✓", 2),
     ("Review D+9 ✓", 9),
     ("Review D+30 ✓", 30),
     ("Review D+90 ✓", 90),
@@ -215,8 +214,8 @@ CATCHUP_THRESHOLD = 5
 
 
 def overdue_reviews(blind75_ds_id: str, today: date) -> list[dict]:
-    """Walks each attempted problem's ladder (Cold ✓ -> D+2 -> D+9 -> D+30 ->
-    D+90) to find whether its next review stage is due.
+    """Walks each attempted problem's ladder (Cold ✓ -> D+9 -> D+30 -> D+90)
+    to find whether its next review stage is due.
 
     A stage's due date is normally Cold ✓ + that stage's fixed offset. But if
     Result on the most recently completed stage was "Partial" or "No" (a hint
@@ -271,7 +270,12 @@ def all_cold_attempted(blind75_ds_id: str) -> list[str]:
 def load_state() -> dict:
     if STATE_PATH.exists():
         return json.loads(STATE_PATH.read_text())
-    return {"last_congratulated_week_start": None, "last_week_seen": None, "streak": 0}
+    return {
+        "last_congratulated_week_start": None,
+        "last_week_seen": None,
+        "streak": 0,
+        "schedule_offset_days": 0,
+    }
 
 
 def save_state(state: dict) -> None:
@@ -310,7 +314,7 @@ def build_nag_embed(today: date, did_cold_today: bool, cold_done: int, cold_targ
                      new_problem_names: list[str] | None = None,
                      come_back_names: list[str] | None = None,
                      new_problem_warnings: dict[str, list[str]] | None = None,
-                     catchup_mode: bool = False) -> dict:
+                     catchup_mode: bool = False, schedule_offset_days: int = 0) -> dict:
     fields = []
     color = 0xF1C40F  # amber default: "you didn't do a problem today"
 
@@ -330,11 +334,10 @@ def build_nag_embed(today: date, did_cold_today: bool, cold_done: int, cold_targ
         listed = ", ".join(all_problems) if all_problems else "nothing logged yet"
         fields.append({"name": "Sunday: go re-read your notes", "value": listed[:1000], "inline": False})
     elif catchup_mode:
-        fields.append({
-            "name": "🐢 Catch-up mode",
-            "value": f"{len(overdue)} reviews overdue — clear these before starting new problems.",
-            "inline": False,
-        })
+        value = f"{len(overdue)} reviews overdue — clear these before starting new problems."
+        if schedule_offset_days > 0:
+            value += f" Schedule is currently {schedule_offset_days}d behind pace."
+        fields.append({"name": "🐢 Catch-up mode", "value": value, "inline": False})
     elif not did_cold_today and (cold_target is None or cold_done < cold_target):
         target_str = (f"{cold_done}/{cold_target} done this week."
                       if cold_target is not None else f"{cold_done} done this week.")
@@ -397,14 +400,41 @@ def main() -> None:
     schedule_ds_id = get_data_source_id(SCHEDULE_DATABASE_ID) if SCHEDULE_DATABASE_ID else None
     weak_patterns_ds_id = get_data_source_id(WEAK_PATTERNS_DATABASE_ID) if WEAK_PATTERNS_DATABASE_ID else None
 
-    week_start, week_end, cold_target, new_ids, come_back_ids = current_week(schedule_ds_id, today)
-    if week_start is None:
+    state = load_state()
+
+    # The review ladder always runs on real dates - never shifted.
+    did_cold_today = cold_attempts_in_range(blind75_ds_id, today, today) > 0
+    overdue = overdue_reviews(blind75_ds_id, today)
+    catchup_mode = len(overdue) >= CATCHUP_THRESHOLD
+
+    # Catch-up mode means today isn't counted as progress on the Master
+    # Schedule: the plan's effective position freezes today and falls one
+    # more day behind real time, resuming from wherever it paused once the
+    # backlog clears. This is purely an internal read-side interpretation -
+    # the Master Schedule's own Dates in Notion are never written to.
+    offset = state.get("schedule_offset_days", 0)
+    if schedule_ds_id and catchup_mode:
+        offset += 1
+    effective_today = today - timedelta(days=offset)
+
+    stored_start, stored_end, cold_target, new_ids, come_back_ids = current_week(schedule_ds_id, effective_today)
+    if stored_start is None:
         # No Master Schedule / no matching week row: fall back to "nag once a
         # day, no weekly cap" mode, same as leaving SCHEDULE_TAB blank in the
-        # original.
+        # original. Real-time window, no plan-week identity to shift.
         week_start = today - timedelta(days=today.weekday())
         week_end = week_start + timedelta(days=6)
-    week_key = week_start.isoformat()
+        week_key = week_start.isoformat()
+    else:
+        # cold_attempts_in_range must be checked against the real calendar
+        # week you're actually living through, not the plan's stored dates -
+        # those two only coincide when offset is 0. week_key stays keyed to
+        # the plan week's own stable identity (stored_start) so a mid-week
+        # offset change doesn't look like "a new week started" to the
+        # streak-reset logic below.
+        week_start = stored_start + timedelta(days=offset)
+        week_end = stored_end + timedelta(days=offset)
+        week_key = stored_start.isoformat()
 
     new_problem_names = come_back_names = []
     new_problem_warnings: dict[str, list[str]] = {}
@@ -425,8 +455,6 @@ def main() -> None:
                 if info and info["pattern"] in weak_map:
                     new_problem_warnings[info["title"]] = weak_map[info["pattern"]]
 
-    state = load_state()
-
     # A new week started without ever hitting quota in the previous one -> streak resets.
     last_seen = state.get("last_week_seen")
     if last_seen and last_seen != week_key and state.get("last_congratulated_week_start") != last_seen:
@@ -434,9 +462,6 @@ def main() -> None:
     state["last_week_seen"] = week_key
 
     cold_done = cold_attempts_in_range(blind75_ds_id, week_start, week_end)
-    did_cold_today = cold_attempts_in_range(blind75_ds_id, today, today) > 0
-    overdue = overdue_reviews(blind75_ds_id, today)
-    catchup_mode = len(overdue) >= CATCHUP_THRESHOLD
     hit_quota = cold_target is not None and cold_done >= cold_target
 
     if hit_quota and state.get("last_congratulated_week_start") != week_key:
@@ -444,13 +469,14 @@ def main() -> None:
         state["last_congratulated_week_start"] = week_key
         post_discord(build_congrats_embed(state["streak"], cold_done, cold_target))
 
+    state["schedule_offset_days"] = offset
     state["last_run_date"] = datetime.now(TZ).date().isoformat()
     save_state(state)
 
     all_problems = all_cold_attempted(blind75_ds_id) if is_sunday else []
     embed = build_nag_embed(today, did_cold_today, cold_done, cold_target, overdue, is_sunday,
                              all_problems, new_problem_names, come_back_names, new_problem_warnings,
-                             catchup_mode)
+                             catchup_mode, offset)
     if embed:
         post_discord(embed)
     # else: quiet day, no Discord ping.
