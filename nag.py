@@ -2,7 +2,7 @@
 """
 leetcode-nagger (Notion edition)
 
-Reads a Blind 75 Tracker and a Master Schedule from Notion, decides whether
+Reads a NeetCode 150 Tracker and a Master Schedule from Notion, decides whether
 there's anything to nag about today, and posts to a Discord webhook.
 
 Port of https://github.com/sandera0606/leetcode-nagger from Google Sheets to
@@ -31,7 +31,7 @@ except ImportError:
     pass
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-BLIND75_DATABASE_ID = os.environ["BLIND75_DATABASE_ID"]
+NEETCODE150_DATABASE_ID = os.environ["NEETCODE150_DATABASE_ID"]
 SCHEDULE_DATABASE_ID = os.environ.get("SCHEDULE_DATABASE_ID")  # optional, like original SCHEDULE_TAB
 WEAK_PATTERNS_DATABASE_ID = os.environ.get("WEAK_PATTERNS_DATABASE_ID")  # optional
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
@@ -185,14 +185,14 @@ def current_week(schedule_ds_id: str | None, today: date):
 # Tracker
 # ---------------------------------------------------------------------------
 
-def cold_attempts_in_range(blind75_ds_id: str, start: date, end: date) -> int:
+def cold_attempts_in_range(neetcode150_ds_id: str, start: date, end: date) -> int:
     filter_obj = {
         "and": [
             {"property": "Cold ✓", "date": {"on_or_after": start.isoformat()}},
             {"property": "Cold ✓", "date": {"on_or_before": end.isoformat()}},
         ]
     }
-    return len(query_data_source(blind75_ds_id, filter_obj))
+    return len(query_data_source(neetcode150_ds_id, filter_obj))
 
 
 # Spaced-repetition ladder: each stage's Notion property, and its offset in
@@ -213,7 +213,7 @@ RETRY_INTERVAL_DAYS = 4
 CATCHUP_THRESHOLD = 5
 
 
-def overdue_reviews(blind75_ds_id: str, today: date) -> list[dict]:
+def overdue_reviews(neetcode150_ds_id: str, today: date) -> list[dict]:
     """Walks each attempted problem's ladder (Cold ✓ -> D+9 -> D+30 -> D+90)
     to find whether its next review stage is due.
 
@@ -226,7 +226,7 @@ def overdue_reviews(blind75_ds_id: str, today: date) -> list[dict]:
     """
     overdue = []
     filter_obj = {"property": "Cold ✓", "date": {"is_not_empty": True}}
-    for page in query_data_source(blind75_ds_id, filter_obj):
+    for page in query_data_source(neetcode150_ds_id, filter_obj):
         cold = prop_date(page, "Cold ✓")
         result = prop_select(page, "Result")
 
@@ -258,9 +258,9 @@ def overdue_reviews(blind75_ds_id: str, today: date) -> list[dict]:
     return overdue
 
 
-def all_cold_attempted(blind75_ds_id: str) -> list[str]:
+def all_cold_attempted(neetcode150_ds_id: str) -> list[str]:
     filter_obj = {"property": "Cold ✓", "date": {"is_not_empty": True}}
-    return [prop_title(p, "Problem") for p in query_data_source(blind75_ds_id, filter_obj)]
+    return [prop_title(p, "Problem") for p in query_data_source(neetcode150_ds_id, filter_obj)]
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +322,7 @@ def build_nag_embed(today: date, did_cold_today: bool, cold_done: int, cold_targ
         color = 0xE74C3C  # red wins over everything else
         lines = []
         for o in overdue[:10]:
-            line = f"• {o['name']} ({o['difficulty']}) — {(today - o['since']).days}d overdue"
+            line = f"• **{o['name']}** (`{o['difficulty']}`) — `{(today - o['since']).days}d overdue`"
             if o.get("last_snag"):
                 line += f' — last snag: "{o["last_snag"][:100]}"'
             lines.append(line)
@@ -331,12 +331,12 @@ def build_nag_embed(today: date, did_cold_today: bool, cold_done: int, cold_targ
     if is_sunday:
         if not overdue:
             color = 0x3498DB  # blue, but only if nothing worse is going on
-        listed = ", ".join(all_problems) if all_problems else "nothing logged yet"
+        listed = ", ".join(f"**{p}**" for p in all_problems) if all_problems else "nothing logged yet"
         fields.append({"name": "Sunday: go re-read your notes", "value": listed[:1000], "inline": False})
     elif catchup_mode:
         value = f"{len(overdue)} reviews overdue — clear these before starting new problems."
         if schedule_offset_days > 0:
-            value += f" Schedule is currently {schedule_offset_days}d behind pace."
+            value += f" Schedule is currently `{schedule_offset_days}d behind pace`."
         fields.append({"name": "🐢 Catch-up mode", "value": value, "inline": False})
     elif not did_cold_today and (cold_target is None or cold_done < cold_target):
         target_str = (f"{cold_done}/{cold_target} done this week."
@@ -344,7 +344,7 @@ def build_nag_embed(today: date, did_cold_today: bool, cold_done: int, cold_targ
         if new_problem_names:
             lines = [f"{target_str}"]
             for n in new_problem_names:
-                lines.append(f"• {n}")
+                lines.append(f"• **{n}**")
                 for warning in (new_problem_warnings or {}).get(n, []):
                     lines.append(f"  ⚠ {warning}")
             value = "\n".join(lines)
@@ -355,7 +355,7 @@ def build_nag_embed(today: date, did_cold_today: bool, cold_done: int, cold_targ
     if not is_sunday and come_back_names:
         fields.append({
             "name": "This week's reviews",
-            "value": "\n".join(f"• {n}" for n in come_back_names)[:1000],
+            "value": "\n".join(f"• **{n}**" for n in come_back_names)[:1000],
             "inline": False,
         })
 
@@ -380,8 +380,8 @@ def build_congrats_embed(streak: int, cold_done: int, cold_target: int) -> dict:
             "title": random.choice(SNARKY_TITLES),
             "color": 0x2ECC71,  # green, deliberately no @-mention
             "fields": [
-                {"name": "Streak", "value": f"{streak}-week streak.", "inline": True},
-                {"name": "This week", "value": f"{cold_done}/{cold_target} done.", "inline": True},
+                {"name": "Streak", "value": f"`{streak}`-week streak.", "inline": True},
+                {"name": "This week", "value": f"`{cold_done}/{cold_target}` done.", "inline": True},
             ],
             "footer": {"text": "Don't get cocky."},
         }],
@@ -396,15 +396,15 @@ def main() -> None:
     today = datetime.now(TZ).date()
     is_sunday = today.weekday() == 6  # Monday=0 ... Sunday=6
 
-    blind75_ds_id = get_data_source_id(BLIND75_DATABASE_ID)
+    neetcode150_ds_id = get_data_source_id(NEETCODE150_DATABASE_ID)
     schedule_ds_id = get_data_source_id(SCHEDULE_DATABASE_ID) if SCHEDULE_DATABASE_ID else None
     weak_patterns_ds_id = get_data_source_id(WEAK_PATTERNS_DATABASE_ID) if WEAK_PATTERNS_DATABASE_ID else None
 
     state = load_state()
 
     # The review ladder always runs on real dates - never shifted.
-    did_cold_today = cold_attempts_in_range(blind75_ds_id, today, today) > 0
-    overdue = overdue_reviews(blind75_ds_id, today)
+    did_cold_today = cold_attempts_in_range(neetcode150_ds_id, today, today) > 0
+    overdue = overdue_reviews(neetcode150_ds_id, today)
     catchup_mode = len(overdue) >= CATCHUP_THRESHOLD
 
     # Catch-up mode means today isn't counted as progress on the Master
@@ -439,7 +439,7 @@ def main() -> None:
     new_problem_names = come_back_names = []
     new_problem_warnings: dict[str, list[str]] = {}
     if new_ids or come_back_ids:
-        problem_info = fetch_problem_info(blind75_ds_id)
+        problem_info = fetch_problem_info(neetcode150_ds_id)
         new_problem_names = [problem_info[i]["title"] for i in new_ids if i in problem_info]
         # Only nag to review a problem that's actually been attempted -
         # Come Back To can reference problems from the study plan's assumed
@@ -461,7 +461,7 @@ def main() -> None:
         state["streak"] = 0
     state["last_week_seen"] = week_key
 
-    cold_done = cold_attempts_in_range(blind75_ds_id, week_start, week_end)
+    cold_done = cold_attempts_in_range(neetcode150_ds_id, week_start, week_end)
     hit_quota = cold_target is not None and cold_done >= cold_target
 
     if hit_quota and state.get("last_congratulated_week_start") != week_key:
@@ -473,7 +473,7 @@ def main() -> None:
     state["last_run_date"] = datetime.now(TZ).date().isoformat()
     save_state(state)
 
-    all_problems = all_cold_attempted(blind75_ds_id) if is_sunday else []
+    all_problems = all_cold_attempted(neetcode150_ds_id) if is_sunday else []
     embed = build_nag_embed(today, did_cold_today, cold_done, cold_target, overdue, is_sunday,
                              all_problems, new_problem_names, come_back_names, new_problem_warnings,
                              catchup_mode, offset)

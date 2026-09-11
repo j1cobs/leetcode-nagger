@@ -41,7 +41,7 @@ jobs:
         if: env.SKIP != 'true'
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          BLIND75_DATABASE_ID: ${{ secrets.BLIND75_DATABASE_ID }}
+          NEETCODE150_DATABASE_ID: ${{ secrets.NEETCODE150_DATABASE_ID }}
           SCHEDULE_DATABASE_ID: ${{ secrets.SCHEDULE_DATABASE_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
